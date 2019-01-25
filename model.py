@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as functional
 import numpy as np
 import torchvision.models as models
+import math
 
 
 class CNNMRF(nn.Module):
@@ -101,9 +102,13 @@ class CNNMRF(nn.Module):
         max_response = torch.reshape(max_response, (1, -1)).squeeze()
         # loss
         loss = 0
-        for tp_ind, sp_ind in zip(range(len(max_response)), max_response):
-            loss += torch.mean(torch.pow(synthesis_patches[tp_ind]-style_patches[sp_ind], 2))
-        loss = loss/len(max_response)
+        for i in range(0, len(max_response), self.gpu_chunck_size):
+            i_start = i
+            i_end = min(i+self.gpu_chunck_size, len(max_response))
+            tp_ind = tuple(range(i_start, i_end))
+            sp_ind = max_response[i_start:i_end]
+            loss += torch.mean(torch.pow(synthesis_patches[tp_ind, :, :, :]-style_patches[sp_ind, :, :, :], 2))
+        loss = loss / math.ceil(len(max_response)/self.gpu_chunck_size)
         return loss
 
     def cal_content_loss(self, synthesis):

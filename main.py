@@ -135,7 +135,7 @@ if __name__ == '__main__':
     parser.add_argument('--sample_step', type=int, default=50)
     parser.add_argument('--content_weight', type=float, default=1)
     parser.add_argument('--num_res', type=int, default=3)
-    parser.add_argument('--gpu_chunck_size', type=int, default=256)
+    parser.add_argument('--gpu_chunck_size', type=int, default=512)
     parser.add_argument('--mrf_style_stride', type=int, default=2)
     parser.add_argument('--mrf_synthesis_stride', type=int, default=2)
     config = parser.parse_args()
