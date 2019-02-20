@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as functional
 import numpy as np
 import torchvision.models as models
-import math
 
 
 class CNNMRF(nn.Module):
@@ -21,11 +20,10 @@ class CNNMRF(nn.Module):
         self.vgg = VGGNet().to(self.device).eval()
         self.mrf_style_stride = mrf_style_stride
         self.mrf_synthesis_stride = mrf_synthesis_stride
+        self.mrf_layer_list = ['relu3_1', 'relu4_1']
         # style_patches, style_patches_norm, content_image_feature_map
-        self.style_patches_relu3_1 = None
-        self.style_patches_norm_relu3_1 = None
-        self.style_patches_relu4_1 = None
-        self.style_patches_norm_relu4_1 = None
+        self.style_patches = dict()
+        self.style_patches_norm = dict()
         self.content_image_feature_map = None
         self.update_params(style_image, content_image)
 
@@ -35,10 +33,13 @@ class CNNMRF(nn.Module):
         :param synthesis: synthesis image
         :return:
         """
-        mrf_loss = self.cal_mrf_loss(synthesis, 'relu3_1') + self.cal_mrf_loss(synthesis, 'relu4_1')
+        mrf_loss = 0
+        for layer in self.mrf_layer_list:
+            mrf_loss += self.cal_mrf_loss(synthesis, layer)
+
         content_loss = self.cal_content_loss(synthesis)
         tv_loss = self.cal_tv_loss(synthesis)
-        loss = mrf_loss/2 + self.content_weight * content_loss + self.tv_weight * tv_loss
+        loss = mrf_loss + self.content_weight * content_loss + self.tv_weight * tv_loss
         return loss
 
     def update_params(self, style_image, content_image):
@@ -50,18 +51,14 @@ class CNNMRF(nn.Module):
         :return:
         """
         # style image patches
-        style_image_relu3_1 = self.vgg(style_image, layer='relu3_1')
-        self.style_patches_relu3_1 = self.patches_sampling(style_image_relu3_1, patch_size=self.patch_size, stride=self.mrf_style_stride)
-
-        # style image patches
-        style_image_relu4_1 = self.vgg(style_image, layer='relu4_1')
-        self.style_patches_relu4_1 = self.patches_sampling(style_image_relu4_1, patch_size=self.patch_size, stride=self.mrf_style_stride)
+        for layer in self.mrf_layer_list:
+            image_feature = self.vgg(style_image, layer=layer)
+            self.style_patches[layer] = self.patches_sampling(image_feature, patch_size=self.patch_size, stride=self.mrf_style_stride)
+            self.style_patches_norm[layer] = None
 
         "-----------------------"
         # content image feature map
         self.content_image_feature_map = self.vgg(content_image, layer='relu4_2')
-        self.style_patches_norm_relu3_1 = None
-        self.style_patches_norm_relu4_1 = None
 
     def cal_mrf_loss(self, synthesis, vgg_layer):
         """
@@ -70,14 +67,9 @@ class CNNMRF(nn.Module):
         :param vgg_layer: vgg_layer name to extract feature map of image
         :return:
         """
-        if vgg_layer == 'relu3_1':
-            style_patches = self.style_patches_relu3_1
-            style_patches_norm = self.style_patches_norm_relu3_1
-        elif vgg_layer == 'relu4_1':
-            style_patches = self.style_patches_relu4_1
-            style_patches_norm = self.style_patches_norm_relu4_1
-        else:
-            raise ValueError('cal_mrf_loss: layer should be relu3_1 or relu4_1')
+        style_patches = self.style_patches[vgg_layer]
+        style_patches_norm = self.style_patches_norm[vgg_layer]
+
         synthesis = self.vgg(synthesis, layer=vgg_layer)
         synthesis_patches = self.patches_sampling(synthesis, patch_size=self.patch_size, stride=self.mrf_synthesis_stride)
         max_response = []
@@ -90,12 +82,8 @@ class CNNMRF(nn.Module):
         max_response = torch.cat(max_response, dim=0)
 
         if style_patches_norm is None:
-            if vgg_layer == 'relu3_1':
-                self.style_patches_norm_relu3_1 = self.cal_style_patches_norm(vgg_layer, max_response.shape)
-                style_patches_norm = self.style_patches_norm_relu3_1
-            else:
-                self.style_patches_norm_relu4_1 = self.cal_style_patches_norm(vgg_layer, max_response.shape)
-                style_patches_norm = self.style_patches_norm_relu4_1
+            self.style_patches_norm[vgg_layer] = self.cal_style_patches_norm(vgg_layer, max_response.shape)
+            style_patches_norm = self.style_patches_norm[vgg_layer]
 
         max_response = max_response * style_patches_norm
         max_response = torch.argmax(max_response, dim=0)
@@ -107,8 +95,8 @@ class CNNMRF(nn.Module):
             i_end = min(i+self.gpu_chunck_size, len(max_response))
             tp_ind = tuple(range(i_start, i_end))
             sp_ind = max_response[i_start:i_end]
-            loss += torch.mean(torch.pow(synthesis_patches[tp_ind, :, :, :]-style_patches[sp_ind, :, :, :], 2))
-        loss = loss / math.ceil(len(max_response)/self.gpu_chunck_size)
+            loss += torch.sum(torch.mean(torch.pow(synthesis_patches[tp_ind, :, :, :]-style_patches[sp_ind, :, :, :], 2), dim=[1, 2, 3]))
+        loss = loss / len(max_response)
         return loss
 
     def cal_content_loss(self, synthesis):
@@ -151,13 +139,7 @@ class CNNMRF(nn.Module):
         """
         # norm of style image patches
         norm_array = torch.ones(shape)
-        if layer == 'relu3_1':
-            patches = self.style_patches_relu3_1
-        elif layer == 'relu4_1':
-            patches = self.style_patches_relu4_1
-        else:
-            raise ValueError('layer should be relu3_1 or relu4_1')
-
+        patches = self.style_patches[layer]
         for i in range(patches.shape[0]):
             norm_array[i] = norm_array[i] / self.cal_norm(patches[i])
         return norm_array.to(self.device)
