@@ -5,8 +5,8 @@ import cv2
 import argparse
 import torch
 import torchvision
-import math
 import os
+import torch.nn.functional as functional
 
 """
 reference:
@@ -14,9 +14,11 @@ reference:
 //Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition. 2016: 2479-2486.
 
 [2]. https://github.com/yunjey/pytorch-tutorial/blob/master/tutorials/03-advanced/neural_style_transfer/main.py
+
+[3]. https://heartbeat.fritz.ai/neural-style-transfer-with-pytorch-49e7c1fe3bea
 """
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 
 def get_synthesis_image(synthesis, denorm):
@@ -41,11 +43,9 @@ def unsample_synthesis(height, width, synthesis, device):
     :return:
     """
     # transform the tensor to numpy, and upsampled as a image
-    synthesis = synthesis.cpu().detach().squeeze().permute([1, 2, 0]).numpy()
-    synthesis = cv2.resize(synthesis, (width, height), cv2.INTER_LINEAR)
-    synthesis = torch.Tensor(synthesis).permute([2, 0, 1]).unsqueeze(0).to(device)
+    synthesis = functional.interpolate(synthesis, size=[height, width], mode='bilinear')
     # finally, set requires grad, the node will be leaf node and require grad
-    synthesis = synthesis.requires_grad_(True)
+    synthesis = synthesis.clone().detach().requires_grad_(True).to(device)
     return synthesis
 
 
@@ -66,29 +66,32 @@ def main(config):
         raise ValueError('file %s does not exist.' % config.style_path)
     content_image = cv2.imread(config.content_path)
     content_image = cv2.cvtColor(content_image, cv2.COLOR_BGR2RGB)
+    content_image = transform(content_image).unsqueeze(0).to(device)
+
     style_image = cv2.imread(config.style_path)
     style_image = cv2.cvtColor(style_image, cv2.COLOR_BGR2RGB)
+    style_image = transform(style_image).unsqueeze(0).to(device)
+
     "resize image in several level for training"
     pyramid_content_image = []
     pyramid_style_image = []
     for i in range(config.num_res):
-        content = cv2.resize(content_image, (math.ceil(content_image.shape[1]/pow(2, config.num_res-1-i)),
-                                             math.ceil(content_image.shape[0]/pow(2, config.num_res-1-i))),
-                             interpolation=cv2.INTER_LINEAR)
+        content = functional.interpolate(content_image, scale_factor=1/pow(2, config.num_res-1-i), mode='bilinear')
 
-        style = cv2.resize(style_image, (math.ceil(style_image.shape[1]/pow(2, config.num_res-1-i)),
-                                         math.ceil(style_image.shape[0]/pow(2, config.num_res-1-i))),
-                           interpolation=cv2.INTER_LINEAR)
-        pyramid_content_image.append(transform(content).unsqueeze(0).to(device))
-        pyramid_style_image.append(transform(style).unsqueeze(0).to(device))
+        style = functional.interpolate(style_image, scale_factor=1/pow(2, config.num_res-1-i), mode='bilinear')
+
+        pyramid_content_image.append(content)
+        pyramid_style_image.append(style)
     "-----------------start training-------"
     global iter
     iter = 0
     synthesis = None
     # create cnnmrf model
     cnnmrf = CNNMRF(style_image=pyramid_style_image[0], content_image=pyramid_content_image[0], device=device,
-                    content_weight=config.content_weight, gpu_chunck_size=config.gpu_chunck_size,
-                    mrf_synthesis_stride=config.mrf_synthesis_stride, mrf_style_stride=config.mrf_style_stride).to(device)
+                    content_weight=config.content_weight, style_weight=config.style_weight, tv_weight=config.tv_weight,
+                    gpu_chunck_size=config.gpu_chunck_size, mrf_synthesis_stride=config.mrf_synthesis_stride,
+                    mrf_style_stride=config.mrf_style_stride).to(device)
+
     # Sets the module in training mode.
     cnnmrf.train()
     for i in range(0, config.num_res):
@@ -99,7 +102,7 @@ def main(config):
         else:
             # in high level init the synthesis from unsampling the upper level synthesis
             synthesis = unsample_synthesis(pyramid_content_image[i].shape[2], pyramid_content_image[i].shape[3], synthesis, device)
-            cnnmrf.update_params(style_image=pyramid_style_image[i], content_image=pyramid_content_image[i])
+            cnnmrf.update_style_and_content_image(style_image=pyramid_style_image[i], content_image=pyramid_content_image[i])
         # max_iter (int): maximal number of iterations per optimization step
         optimizer = optim.LBFGS([synthesis], lr=1, max_iter=config.max_iter)
         "--------------------"
@@ -108,19 +111,19 @@ def main(config):
             global iter
             optimizer.zero_grad()
             loss = cnnmrf(synthesis)
-            if (iter+1) % config.max_iter == 0:
-                loss.backward(retain_graph=False)
-            else:
-                loss.backward(retain_graph=True)
-            # save image
-            if (iter + 1) % config.sample_step == 0 or (iter + 1) == (i + 1) * config.max_iter:
-                image = get_synthesis_image(synthesis, denorm_transform)
-                torchvision.utils.save_image(image, 'result-%d.jpg' % (iter + 1))
-                print('save image: result-%d.jpg' % (iter+1))
+            loss.backward(retain_graph=True)
             # print loss
             if (iter + 1) % 10 == 0:
-                print('iteration %d: %f' % (iter + 1, loss.item()))
+                print('res-%d-iteration-%d: %f' % (i+1, iter + 1, loss.item()))
+            # save image
+            if (iter + 1) % config.sample_step == 0 or iter + 1 == config.max_iter:
+                image = get_synthesis_image(synthesis, denorm_transform)
+                image = functional.interpolate(image.unsqueeze(0), size=content_image.shape[2:4], mode='bilinear')
+                torchvision.utils.save_image(image.squeeze(), 'res-%d-result-%d.jpg' % (i+1, iter + 1))
+                print('save image: res-%d-result-%d.jpg' % (i+1, iter + 1))
             iter += 1
+            if iter == config.max_iter:
+                iter = 0
             return loss
 
         "----------------------"
@@ -134,6 +137,8 @@ if __name__ == '__main__':
     parser.add_argument('--max_iter', type=int, default=100)
     parser.add_argument('--sample_step', type=int, default=50)
     parser.add_argument('--content_weight', type=float, default=1)
+    parser.add_argument('--style_weight', type=float, default=0.4)
+    parser.add_argument('--tv_weight', type=float, default=0.1)
     parser.add_argument('--num_res', type=int, default=3)
     parser.add_argument('--gpu_chunck_size', type=int, default=512)
     parser.add_argument('--mrf_style_stride', type=int, default=2)
