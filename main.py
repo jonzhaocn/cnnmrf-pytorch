@@ -21,16 +21,23 @@ reference:
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 
-def get_synthesis_image(synthesis, denorm):
+def get_synthesis_image(synthesis, denorm, device):
     """
     get synthesis image from tensor to numpy array
     :param synthesis: synthesis image tensor
     :param denorm: denorm transform
     :return:
     """
-    image = synthesis.clone().squeeze()
-    image = denorm(image).clamp_(0, 1)
-    return image
+    cpu_device = torch.device('cpu')
+
+    # move image to cpu before denormalizing according to
+    # https://github.com/JZhaoCH/cnnmrf-pytorch/issues/1 and https://github.com/JZhaoCH/cnnmrf-pytorch/issues/2
+    image = synthesis.clone().squeeze().to(cpu_device)
+
+    image = denorm(image)
+
+    # finally move image back to device
+    return image.to(device).clamp_(0, 1)
 
 
 def unsample_synthesis(height, width, synthesis, device):
@@ -56,9 +63,9 @@ def main(config):
     # and std=[0.229, 0.224, 0.225].
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.485, 0.456, 0.406),
-                             std=(0.229, 0.224, 0.225))])
-    denorm_transform = transforms.Normalize((-2.12, -2.04, -1.80), (4.37, 4.46, 4.44))
+        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))])
+    denorm_transform = transforms.Normalize(mean=(-2.12, -2.04, -1.80), std=(4.37, 4.46, 4.44))
+
     "--------------read image------------------"
     if not os.path.exists(config.content_path):
         raise ValueError('file %s does not exist.' % config.content_path)
@@ -117,7 +124,7 @@ def main(config):
                 print('res-%d-iteration-%d: %f' % (i+1, iter + 1, loss.item()))
             # save image
             if (iter + 1) % config.sample_step == 0 or iter + 1 == config.max_iter:
-                image = get_synthesis_image(synthesis, denorm_transform)
+                image = get_synthesis_image(synthesis, denorm_transform, device)
                 image = functional.interpolate(image.unsqueeze(0), size=content_image.shape[2:4], mode='bilinear')
                 torchvision.utils.save_image(image.squeeze(), 'res-%d-result-%d.jpg' % (i+1, iter + 1))
                 print('save image: res-%d-result-%d.jpg' % (i+1, iter + 1))
